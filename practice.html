@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smooth AR Shooter with Skeleton Kill</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <style>
+        :root {
+            --primary: #00ffcc;
+            --bg-dark: #0f0f13;
+        }
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-dark);
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden; 
+        }
+        #game-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: radial-gradient(circle at center, #1a1a24 0%, #000000 100%);
+        }
+        video {
+            display: none; 
+        }
+        canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            transform: scaleX(-1); 
+        }
+        .ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 30px;
+            box-sizing: border-box;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            padding: 15px 40px;
+            border-radius: 20px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        h1 {
+            margin: 0;
+            font-size: 28px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: var(--primary);
+            text-shadow: 0 0 10px var(--primary);
+        }
+        #score-display {
+            font-size: 28px;
+            font-weight: bold;
+        }
+        .hud-bottom {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+        }
+        .launcher-hud {
+            padding: 15px 30px;
+            background: linear-gradient(to top, rgba(0,255,204,0.1), transparent);
+            border-radius: 10px;
+            color: var(--primary);
+            font-size: 18px;
+            font-weight: bold;
+            letter-spacing: 1px;
+            border-bottom: 3px solid var(--primary);
+        }
+        #dual-wield-alert {
+            color: #ff00cc;
+            font-size: 24px;
+            font-weight: bold;
+            text-shadow: 0 0 15px #ff00cc;
+            display: none;
+            animation: pulse 1s infinite;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 24px;
+            color: var(--primary);
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 0.5; transform: scale(0.95); }
+            50% { opacity: 1; transform: scale(1.05); }
+            100% { opacity: 0.5; transform: scale(0.95); }
+        }
+    </style>
+</head>
+<body>
+
+    <div id="game-container">
+        <video id="input_video"></video>
+        <canvas id="output_canvas"></canvas>
+        <div id="loading">Initializing Ultra-Smooth Tracking...</div>
+        
+        <div class="ui-layer">
+            <div class="header">
+                <h1>AR Recoil Shooter</h1>
+                <div id="score-display">Kills: 0</div>
+            </div>
+            <div class="hud-bottom">
+                <div class="launcher-hud">
+                    AIM: Index Finger | SHOOT: Flick Hand Upward
+                </div>
+                <div id="dual-wield-alert">DUAL WIELD UNLOCKED!</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const scoreDisplay = document.getElementById('score-display');
+        const loadingText = document.getElementById('loading');
+        const dualWieldAlert = document.getElementById('dual-wield-alert');
+
+        let score = 0;
+        let targets = [];
+
+        // Separating raw AI coordinates from smooth screen coordinates
+        let crosshairs = [
+            { rawX: -100, rawY: -100, smoothX: window.innerWidth/2, smoothY: window.innerHeight/2, prevY: 0, isShooting: false, cooldown: 0, active: false },
+            { rawX: -100, rawY: -100, smoothX: window.innerWidth/2, smoothY: window.innerHeight/2, prevY: 0, isShooting: false, cooldown: 0, active: false }
+        ];
+
+        function resizeCanvas() {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        function spawnTarget() {
+            targets.push({
+                x: Math.random() * (canvasElement.width - 120) + 60,
+                y: Math.random() * (canvasElement.height - 120) + 60,
+                radius: 35,
+                vx: (Math.random() > 0.5 ? 1 : -1) * (3 + Math.random() * 4),
+                vy: (Math.random() > 0.5 ? 1 : -1) * (3 + Math.random() * 4),
+                isDead: false,
+                splatterTimer: 0 // Will count down from 60 for skeleton fade effect
+            });
+
+            if(targets.length >= 10) {
+                dualWieldAlert.style.display = 'block';
+            }
+        }
+
+        spawnTarget();
+
+        // --- MEDIAPIPE AI SETUP ---
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+        
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+        
+        // AI strictly updates the RAW positions
+        hands.onResults((results) => {
+            crosshairs[0].active = false;
+            crosshairs[1].active = false;
+
+            if (results.multiHandLandmarks) {
+                for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                    if (i === 1 && targets.length < 10) continue; // Lock 2nd hand till 10 targets
+
+                    const landmarks = results.multiHandLandmarks[i];
+                    const indexTip = landmarks[8];
+                    
+                    crosshairs[i].rawX = indexTip.x * canvasElement.width;
+                    crosshairs[i].rawY = indexTip.y * canvasElement.height;
+                    crosshairs[i].active = true;
+                }
+            }
+        });
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+        
+        camera.start().then(() => {
+            loadingText.style.display = 'none';
+            gameLoop(); // Start the 60FPS render loop once camera is ready
+        });
+
+        // --- 60 FPS GAME LOOP (For Buttery Smoothness) ---
+        function gameLoop() {
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            updateTargets();
+            drawTargets();
+
+            for (let i = 0; i < 2; i++) {
+                let ch = crosshairs[i];
+                if (!ch.active) continue;
+
+                // LERP for smooth monitor refresh rate movement (much faster than AI frame rate)
+                ch.smoothX += (ch.rawX - ch.smoothX) * 0.4;
+                ch.smoothY += (ch.rawY - ch.smoothY) * 0.4;
+
+                let dy = ch.smoothY - ch.prevY;
+                
+                if (ch.cooldown > 0) ch.cooldown--;
+
+                // Recoil Shoot Logic (Upward Flick)
+                if (dy < -25 && ch.cooldown === 0) { 
+                    ch.isShooting = true;
+                    ch.cooldown = 20; 
+                    checkHit(i);
+                } else if (dy > -5 && ch.cooldown < 10) {
+                    ch.isShooting = false;
+                }
+
+                ch.prevY = ch.smoothY;
+
+                drawCrosshair(ch.smoothX, ch.smoothY, ch.isShooting, i);
+            }
+
+            requestAnimationFrame(gameLoop); // Call next frame immediately
+        }
+
+        function updateTargets() {
+            for (let i = targets.length - 1; i >= 0; i--) {
+                let t = targets[i];
+
+                if (t.isDead) {
+                    t.splatterTimer--;
+                    if (t.splatterTimer <= 0) {
+                        targets.splice(i, 1);
+                        spawnTarget();
+                        spawnTarget(); 
+                    }
+                    continue;
+                }
+
+                if (Math.random() < 0.03) {
+                    t.vx += (Math.random() - 0.5) * 3;
+                    t.vy += (Math.random() - 0.5) * 3;
+                }
+
+                t.x += t.vx;
+                t.y += t.vy;
+
+                if (t.x < t.radius) { t.x = t.radius; t.vx *= -1; }
+                if (t.x > canvasElement.width - t.radius) { t.x = canvasElement.width - t.radius; t.vx *= -1; }
+                if (t.y < t.radius) { t.y = t.radius; t.vy *= -1; }
+                if (t.y > canvasElement.height - t.radius) { t.y = canvasElement.height - t.radius; t.vy *= -1; }
+            }
+        }
+
+        function drawTargets() {
+            for (let t of targets) {
+                if (t.isDead) {
+                    // --- SKELETON / SKULL DRAWING ---
+                    canvasCtx.save();
+                    // Fade out effect based on timer (starts at 60)
+                    canvasCtx.globalAlpha = Math.max(0, t.splatterTimer / 60);
+                    canvasCtx.translate(t.x, t.y);
+
+                    // Skull Base (Cranium)
+                    canvasCtx.fillStyle = '#e0e0e0';
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(0, -10, t.radius * 0.8, 0, Math.PI * 2); 
+                    canvasCtx.fill();
+
+                    // Jaw
+                    canvasCtx.fillRect(-t.radius * 0.45, 0, t.radius * 0.9, t.radius * 0.8);
+
+                    // Left Eye Cavity
+                    canvasCtx.fillStyle = '#111';
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(-t.radius * 0.35, -5, t.radius * 0.25, 0, Math.PI * 2);
+                    canvasCtx.fill();
+
+                    // Right Eye Cavity
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(t.radius * 0.35, -5, t.radius * 0.25, 0, Math.PI * 2);
+                    canvasCtx.fill();
+
+                    // Nose Cavity
+                    canvasCtx.beginPath();
+                    canvasCtx.moveTo(0, t.radius * 0.15);
+                    canvasCtx.lineTo(-t.radius * 0.1, t.radius * 0.4);
+                    canvasCtx.lineTo(t.radius * 0.1, t.radius * 0.4);
+                    canvasCtx.fill();
+
+                    // Teeth Lines
+                    canvasCtx.strokeStyle = '#111';
+                    canvasCtx.lineWidth = 2;
+                    for(let k = -1; k <= 1; k++) {
+                        canvasCtx.beginPath();
+                        canvasCtx.moveTo(k * 12, t.radius * 0.5);
+                        canvasCtx.lineTo(k * 12, t.radius * 0.8);
+                        canvasCtx.stroke();
+                    }
+
+                    canvasCtx.restore();
+                    continue;
+                }
+
+                // --- ORIGINAL RED BULLSEYE TARGET ---
+                canvasCtx.beginPath();
+                canvasCtx.arc(t.x, t.y, t.radius, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = 'rgba(255, 50, 50, 0.9)';
+                canvasCtx.fill();
+                canvasCtx.lineWidth = 4;
+                canvasCtx.strokeStyle = '#fff';
+                canvasCtx.stroke();
+                
+                canvasCtx.beginPath();
+                canvasCtx.arc(t.x, t.y, t.radius / 2, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = '#fff';
+                canvasCtx.fill();
+            }
+        }
+
+        function drawCrosshair(x, y, isShooting, handIndex) {
+            canvasCtx.beginPath();
+            canvasCtx.arc(x, y, 25, 0, 2 * Math.PI);
+            canvasCtx.lineWidth = 4;
+            let color = handIndex === 0 ? '#00ffcc' : '#ff00cc';
+            if (isShooting) color = '#ffff00'; 
+
+            canvasCtx.strokeStyle = color;
+            canvasCtx.stroke();
+            
+            canvasCtx.moveTo(x - 35, y);
+            canvasCtx.lineTo(x + 35, y);
+            canvasCtx.moveTo(x, y - 35);
+            canvasCtx.lineTo(x, y + 35);
+            canvasCtx.stroke();
+        }
+
+        function checkHit(handIndex) {
+            let ch = crosshairs[handIndex];
+            for (let t of targets) {
+                if (t.isDead) continue;
+
+                const dist = Math.hypot(ch.smoothX - t.x, ch.smoothY - t.y);
+                if (dist < t.radius + 35) { 
+                    t.isDead = true;
+                    t.splatterTimer = 60; // Increased timer so skeleton stays longer
+                    score++;
+                    scoreDisplay.innerText = `Kills: ${score}`;
+                    break; 
+                }
+            }
+        }
+    </script>
+</body>
+</html>
